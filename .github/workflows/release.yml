@@ -1,13 +1,11 @@
 name: Generic artifact build pipeline
 
 # Privacy rules baked into this workflow:
-#   - No Actions artifact transfer; the private release receives assets directly.
+#   - No artifacts. Do not add actions/upload-artifact or download-artifact.
 #   - No releases or assets are ever created on THIS (public) repo.
 #     Project bodies publish releases only to their private RELEASE_TARGET secret.
-#   - builder.projects.json holds only opaque ids; names, release targets, private
-#     credentials, and status Discussion ids live in per-project secrets.
-#   - Status is appended to one private-repo Discussion. This workflow never writes
-#     STATUS.md or calls the private repository Contents API.
+#   - builder.projects.json holds only opaque ids; names + release targets live
+#     in per-project secrets (RELEASE_TARGET_<SUFFIX>, BUILD_BUNDLE_KEY_<SUFFIX>).
 #   - Payload is refreshed frequently from the source side; this just rebuilds.
 
 on:
@@ -23,7 +21,6 @@ on:
         default: all
 
 permissions:
-  actions: read
   contents: read
 
 concurrency:
@@ -37,8 +34,6 @@ jobs:
       projects: ${{ steps.projects.outputs.projects }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
       - id: projects
         shell: pwsh
         run: |
@@ -54,7 +49,6 @@ jobs:
           "projects=$json" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
   build:
-    name: build-${{ matrix.project.id }}
     needs: project-list
     strategy:
       fail-fast: false
@@ -66,33 +60,14 @@ jobs:
         shell: pwsh
     env:
       BUILD_BUNDLE_KEY: ${{ secrets[format('BUILD_BUNDLE_KEY_{0}', matrix.project.secret_suffix)] }}
-      UPDATE_FEED_URL_A: ${{ secrets[format('UPDATE_FEED_URL_A_{0}', matrix.project.secret_suffix)] || secrets.UPDATE_FEED_URL_A }}
-      UPDATE_FEED_URL_B: ${{ secrets[format('UPDATE_FEED_URL_B_{0}', matrix.project.secret_suffix)] || secrets.UPDATE_FEED_URL_B }}
-      # Per-project credentials isolate accounts. The shared name is a temporary
-      # migration fallback for builders published before suffixed secrets existed.
-      PRIVATE_RELEASE_TOKEN: ${{ secrets[format('PRIVATE_RELEASE_TOKEN_{0}', matrix.project.secret_suffix)] || secrets.PRIVATE_RELEASE_TOKEN }}
+      PRIVATE_RELEASE_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
       TARGET_RELEASE_REPO: ${{ secrets[format('RELEASE_TARGET_{0}', matrix.project.secret_suffix)] }}
-      STATUS_DISCUSSION_ID: ${{ secrets[format('STATUS_DISCUSSION_ID_{0}', matrix.project.secret_suffix)] }}
       PROJECT_ID: ${{ matrix.project.id }}
-      PROJECT_REV: ${{ matrix.project.rev }}
-      BUILDER_SHA: ${{ github.sha }}
+      # Generic, name-free cache dir a project body may use for its heavy/3rd-party
+      # build outputs (e.g. a deps prefix) so warm runs skip the slow cold build.
       BUILD_CACHE_DIR: ${{ github.workspace }}/.build-cache
     steps:
       - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Append build start to private Discussion
-        continue-on-error: true
-        run: |
-          ./scripts/status.ps1 `
-            -DiscussionId $env:STATUS_DISCUSSION_ID `
-            -ProjectId $env:PROJECT_ID `
-            -Revision $env:PROJECT_REV `
-            -BuilderSha $env:BUILDER_SHA `
-            -JobName "build-$env:PROJECT_ID" `
-            -Workflow build `
-            -Status in_progress
 
       - name: Prepare source workspace
         run: |
@@ -114,13 +89,20 @@ jobs:
               $out.Dispose()
             }
           }
-          ./scripts/runtime.ps1 -In $payload -Out workspace.zip *> $null
+          ./scripts/runtime.ps1 -In $payload -Out workspace.zip
+          # Use ZipFile.ExtractToDirectory, not Expand-Archive: the latter throws
+          # "Cannot find path ... because it does not exist" on git-archive directory
+          # entries (e.g. nested empty dirs). This handles them and is much faster.
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = (Resolve-Path workspace.zip).Path
           $dest = Join-Path (Get-Location) 'source'
           if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
           [System.IO.Compression.ZipFile]::ExtractToDirectory($zip, $dest)
 
+      # Name-free build cache. Keyed by opaque project id only; the hash is over the
+      # extracted source's dependency build files so a deps/CMake change invalidates it.
+      # Projects with no deps/ simply cache nothing. Restored after source is present so
+      # the body can reuse a warm deps prefix instead of rebuilding it every run.
       - name: Restore build cache
         uses: actions/cache@v4
         with:
@@ -140,55 +122,40 @@ jobs:
         if: runner.os == 'Windows'
         uses: android-actions/setup-android@v3
 
-      - name: Setup supported Node runtime
-        if: runner.os == 'Windows'
-        uses: actions/setup-node@v4
-        with:
-          node-version: '24.x'
-
       - name: Run project body
         run: |
           $script = "workflows/$env:PROJECT_ID.ps1"
           if (-not (Test-Path -LiteralPath $script)) { throw "Missing project body: $script" }
-          $buildLog = Join-Path $env:RUNNER_TEMP 'epb-project-body.log'
-          $safePhase = 'unknown'
-          function Read-SafePhase {
-            if (-not (Test-Path -LiteralPath $buildLog)) { return 'unknown' }
-            $marker = Get-Content -LiteralPath $buildLog -ErrorAction SilentlyContinue |
-              Select-String -Pattern '^EPB_SAFE_PHASE=[A-Za-z0-9_-]+$' |
-              Select-Object -Last 1
-            if ($marker) { return ($marker.Line -replace '^EPB_SAFE_PHASE=', '') }
-            return 'unknown'
-          }
-          try {
-            & $script *> $buildLog
-            $safePhase = Read-SafePhase
-            if ($LASTEXITCODE -ne 0) { throw 'opaque project body returned a failure code' }
-          } catch {
-            $safePhase = Read-SafePhase
-            throw "Opaque project build phase failed at safe phase '$safePhase'."
-          } finally {
-            Remove-Item -LiteralPath $buildLog -Force -ErrorAction SilentlyContinue
-          }
+          & $script
 
-      - name: Append build terminal to private Discussion
+      - name: Write private status
         if: always()
-        continue-on-error: true
         run: |
-          ./scripts/status.ps1 `
-            -DiscussionId $env:STATUS_DISCUSSION_ID `
-            -ProjectId $env:PROJECT_ID `
-            -Revision $env:PROJECT_REV `
-            -BuilderSha $env:BUILDER_SHA `
-            -JobName "build-$env:PROJECT_ID" `
-            -Workflow build `
-            -Status completed `
-            -Conclusion '${{ job.status }}'
+          if ([string]::IsNullOrWhiteSpace($env:TARGET_RELEASE_REPO) -or
+              [string]::IsNullOrWhiteSpace($env:PRIVATE_RELEASE_TOKEN)) { exit 0 }
+          $env:GH_TOKEN = $env:PRIVATE_RELEASE_TOKEN
+          $rawStatus = '${{ job.status }}'
+          $icon = if ($rawStatus -eq 'success') { 'SUCCESS' } else { 'FAILED' }
+          $ts = [DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm') + ' UTC'
+          $runUrl = "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          $md = "# Build Status`n`n" +
+                "| | |`n|---|---|`n" +
+                "| **Status** | $icon |`n" +
+                "| **Last run** | $ts |`n" +
+                "| **Run log** | $runUrl |`n" +
+                "| **Project** | $env:PROJECT_ID |`n`n" +
+                "*Refreshes automatically every ~15 minutes.*`n"
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($md))
+          $sha = ''
+          try { $sha = gh api "repos/$env:TARGET_RELEASE_REPO/contents/STATUS.md" --jq '.sha' 2>$null } catch {}
+          $body = @{ message = "ci: status $ts"; content = $encoded }
+          if ($sha) { $body['sha'] = $sha.Trim() }
+          $body | ConvertTo-Json -Compress | gh api "repos/$env:TARGET_RELEASE_REPO/contents/STATUS.md" -X PUT --input - | Out-Null
+          Write-Host "STATUS.md -> $env:TARGET_RELEASE_REPO"
 
   publish-release:
-    name: release-${{ matrix.project.id }}
     needs: [project-list, build]
-    if: ${{ needs.build.result == 'success' }}
+    if: ${{ success() }}
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -199,28 +166,9 @@ jobs:
       run:
         shell: pwsh
     env:
-      PRIVATE_RELEASE_TOKEN: ${{ secrets[format('PRIVATE_RELEASE_TOKEN_{0}', matrix.project.secret_suffix)] || secrets.PRIVATE_RELEASE_TOKEN }}
+      PRIVATE_RELEASE_TOKEN: ${{ secrets.PRIVATE_RELEASE_TOKEN }}
       TARGET_RELEASE_REPO: ${{ secrets[format('RELEASE_TARGET_{0}', matrix.project.secret_suffix)] }}
-      STATUS_DISCUSSION_ID: ${{ secrets[format('STATUS_DISCUSSION_ID_{0}', matrix.project.secret_suffix)] }}
-      WORKFLOW_API_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.ORG_TOKEN || secrets.GITHUB_TOKEN }}
-      PROJECT_ID: ${{ matrix.project.id }}
-      PROJECT_REV: ${{ matrix.project.rev }}
-      BUILDER_SHA: ${{ github.sha }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Append release start to private Discussion
-        continue-on-error: true
-        run: |
-          ./scripts/status.ps1 `
-            -DiscussionId $env:STATUS_DISCUSSION_ID `
-            -ProjectId $env:PROJECT_ID `
-            -Revision $env:PROJECT_REV `
-            -BuilderSha $env:BUILDER_SHA `
-            -JobName "release-$env:PROJECT_ID" `
-            -Workflow release `
-            -Status in_progress
-
       - name: Publish private release
         run: |
           if ([string]::IsNullOrWhiteSpace($env:TARGET_RELEASE_REPO) -or
@@ -232,132 +180,14 @@ jobs:
           $patch = 2000 + ($runNumber * 10) + [Math]::Max(0, $attempt - 1)
           if ($patch -gt 65535) { throw 'public builder run number exceeded Windows version range' }
           $tag = "v0.1.$patch"
-          "EPB_RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $env:GH_TOKEN = $env:PRIVATE_RELEASE_TOKEN
-          $raw = gh release view $tag --repo $env:TARGET_RELEASE_REPO --json isDraft 2>&1
+          $raw = gh release view $tag --repo $env:TARGET_RELEASE_REPO --json isDraft
           if ($LASTEXITCODE -ne 0) { throw "missing release $tag" }
           $release = $raw | ConvertFrom-Json
           if (-not $release.isDraft) {
             Write-Host "release already published: $tag"
             return
           }
-          $publishOutput = gh release edit $tag --repo $env:TARGET_RELEASE_REPO --draft=false --latest 2>&1
+          gh release edit $tag --repo $env:TARGET_RELEASE_REPO --draft=false --latest
           if ($LASTEXITCODE -ne 0) { throw "release publish failed: $tag" }
           Write-Host "published: $tag"
-
-      - name: Attach measured workflow timing
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:EPB_RELEASE_TAG)) { throw 'release tag was not recorded' }
-          if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_API_TOKEN)) { throw 'workflow API credential unavailable' }
-          $env:GH_TOKEN = $env:WORKFLOW_API_TOKEN
-          $timingDeadline = [DateTimeOffset]::UtcNow.AddMinutes(2)
-          $firstJob = @()
-          $releaseJob = @()
-          $publicationStep = @()
-          do {
-            $jobsRaw = @(gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/jobs?per_page=100" 2>&1 |
-              ForEach-Object { "$_" })
-            if ($LASTEXITCODE -ne 0) { throw 'workflow job timing lookup failed' }
-            try { $jobsDocument = (($jobsRaw -join [Environment]::NewLine) | ConvertFrom-Json) }
-            catch { throw 'workflow timing response was invalid' }
-            $jobs = @($jobsDocument.jobs)
-            $firstJob = @($jobs |
-              Where-Object { -not [string]::IsNullOrWhiteSpace($_.started_at) } |
-              Sort-Object { [DateTimeOffset]::Parse($_.started_at) } |
-              Select-Object -First 1)
-            $releaseJob = @($jobs |
-              Where-Object { $_.name -like "release-$env:PROJECT_ID*" } |
-              Select-Object -First 1)
-            $publicationStep = @($releaseJob.steps |
-              Where-Object { $_.name -eq 'Publish private release' -and -not [string]::IsNullOrWhiteSpace($_.completed_at) } |
-              Select-Object -Last 1)
-            if (($firstJob.Count -eq 0 -or $releaseJob.Count -eq 0 -or $publicationStep.Count -eq 0) -and
-                [DateTimeOffset]::UtcNow -lt $timingDeadline) {
-              Start-Sleep -Seconds 5
-            }
-          } while (($firstJob.Count -eq 0 -or $releaseJob.Count -eq 0 -or $publicationStep.Count -eq 0) -and
-                   [DateTimeOffset]::UtcNow -lt $timingDeadline)
-          if ($firstJob.Count -eq 0 -or $releaseJob.Count -eq 0 -or $publicationStep.Count -eq 0) {
-            throw 'workflow timing evidence is incomplete'
-          }
-          try {
-            $startedAt = ([DateTimeOffset]::Parse($firstJob[0].started_at)).ToUniversalTime()
-            $completedAt = ([DateTimeOffset]::Parse($publicationStep[0].completed_at)).ToUniversalTime()
-          } catch { throw 'workflow timing evidence contains invalid timestamps' }
-          $duration = $completedAt - $startedAt
-          if ($duration.TotalSeconds -lt 0) { throw 'workflow timing evidence is reversed' }
-          $durationText = '{0:00}:{1:00}:{2:00}' -f [int][Math]::Floor($duration.TotalHours), $duration.Minutes, $duration.Seconds
-
-          $env:GH_TOKEN = $env:PRIVATE_RELEASE_TOKEN
-          $releaseRaw = @(gh release view $env:EPB_RELEASE_TAG --repo $env:TARGET_RELEASE_REPO --json body 2>&1 |
-            ForEach-Object { "$_" })
-          if ($LASTEXITCODE -ne 0) { throw 'private release notes lookup failed' }
-          try { $release = (($releaseRaw -join [Environment]::NewLine) | ConvertFrom-Json) }
-          catch { throw 'private release notes response was invalid' }
-          $marker = '<!-- epb-workflow-timing:v1 -->'
-          $existingBody = [string]$release.body
-          $existingBody = [regex]::Replace($existingBody, '(?s)\r?\n?<!-- epb-workflow-timing:v1 -->.*$', '').TrimEnd()
-          $timing = @(
-            $marker
-            '### Workflow timing / 流程時間'
-            ''
-            "- Workflow started / 流程開始: $($startedAt.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))"
-            "- Workflow completed / 流程完成: $($completedAt.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'"))"
-            "- Workflow duration / 流程用時: ``$durationText``"
-            '- Measured from the first job `startedAt` to the completed `Publish private release` step.'
-            '- 由第一個工作嘅 `startedAt` 計到完成 `Publish private release` 步驟，唔係估時間。'
-          ) -join "`n"
-          $updatedBody = if ([string]::IsNullOrWhiteSpace($existingBody)) { $timing } else { "$existingBody`n`n$timing" }
-          $editRaw = @(gh release edit $env:EPB_RELEASE_TAG --repo $env:TARGET_RELEASE_REPO --notes $updatedBody 2>&1 |
-            ForEach-Object { "$_" })
-          if ($LASTEXITCODE -ne 0) { throw 'private release timing update failed' }
-          Write-Host "Workflow timing recorded: $($startedAt.ToString('o')) -> $($completedAt.ToString('o')) ($durationText)."
-
-      - name: Append release terminal to private Discussion
-        if: always()
-        continue-on-error: true
-        run: |
-          ./scripts/status.ps1 `
-            -DiscussionId $env:STATUS_DISCUSSION_ID `
-            -ProjectId $env:PROJECT_ID `
-            -Revision $env:PROJECT_REV `
-            -BuilderSha $env:BUILDER_SHA `
-            -JobName "release-$env:PROJECT_ID" `
-            -Workflow release `
-            -Status completed `
-            -Conclusion '${{ job.status }}' `
-            -Release $env:EPB_RELEASE_TAG
-
-  publish-release-skipped:
-    needs: [project-list, build]
-    if: ${{ always() && needs.project-list.result == 'success' && needs.build.result != 'success' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        project: ${{ fromJSON(needs.project-list.outputs.projects) }}
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: pwsh
-    env:
-      PRIVATE_RELEASE_TOKEN: ${{ secrets[format('PRIVATE_RELEASE_TOKEN_{0}', matrix.project.secret_suffix)] || secrets.PRIVATE_RELEASE_TOKEN }}
-      STATUS_DISCUSSION_ID: ${{ secrets[format('STATUS_DISCUSSION_ID_{0}', matrix.project.secret_suffix)] }}
-      PROJECT_ID: ${{ matrix.project.id }}
-      PROJECT_REV: ${{ matrix.project.rev }}
-      BUILDER_SHA: ${{ github.sha }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Append skipped release to private Discussion
-        if: always()
-        continue-on-error: true
-        run: |
-          ./scripts/status.ps1 `
-            -DiscussionId $env:STATUS_DISCUSSION_ID `
-            -ProjectId $env:PROJECT_ID `
-            -Revision $env:PROJECT_REV `
-            -BuilderSha $env:BUILDER_SHA `
-            -JobName "release-$env:PROJECT_ID" `
-            -Workflow release `
-            -Status skipped `
-            -Conclusion '${{ needs.build.result }}'
