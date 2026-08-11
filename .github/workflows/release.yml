@@ -1,7 +1,7 @@
 name: Generic artifact build pipeline
 
 # Privacy rules baked into this workflow:
-#   - No artifacts. Do not add actions/upload-artifact or download-artifact.
+#   - No Actions artifact transfer; the private release receives assets directly.
 #   - No releases or assets are ever created on THIS (public) repo.
 #     Project bodies publish releases only to their private RELEASE_TARGET secret.
 #   - builder.projects.json holds only opaque ids; names + release targets live
