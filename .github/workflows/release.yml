@@ -250,22 +250,33 @@ jobs:
           if ([string]::IsNullOrWhiteSpace($env:EPB_RELEASE_TAG)) { throw 'release tag was not recorded' }
           if ([string]::IsNullOrWhiteSpace($env:WORKFLOW_API_TOKEN)) { throw 'workflow API credential unavailable' }
           $env:GH_TOKEN = $env:WORKFLOW_API_TOKEN
-          $jobsRaw = @(gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/jobs?per_page=100" 2>&1 |
-            ForEach-Object { "$_" })
-          if ($LASTEXITCODE -ne 0) { throw 'workflow job timing lookup failed' }
-          try { $jobsDocument = (($jobsRaw -join [Environment]::NewLine) | ConvertFrom-Json) }
-          catch { throw 'workflow job timing response was invalid' }
-          $jobs = @($jobsDocument.jobs)
-          $firstJob = @($jobs |
-            Where-Object { -not [string]::IsNullOrWhiteSpace($_.started_at) } |
-            Sort-Object { [DateTimeOffset]::Parse($_.started_at) } |
-            Select-Object -First 1)
-          $releaseJob = @($jobs |
-            Where-Object { $_.name -like "release-$env:PROJECT_ID*" } |
-            Select-Object -First 1)
-          $publicationStep = @($releaseJob.steps |
-            Where-Object { $_.name -eq 'Publish private release' -and -not [string]::IsNullOrWhiteSpace($_.completed_at) } |
-            Select-Object -Last 1)
+          $timingDeadline = [DateTimeOffset]::UtcNow.AddMinutes(2)
+          $firstJob = @()
+          $releaseJob = @()
+          $publicationStep = @()
+          do {
+            $jobsRaw = @(gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID/jobs?per_page=100" 2>&1 |
+              ForEach-Object { "$_" })
+            if ($LASTEXITCODE -ne 0) { throw 'workflow job timing lookup failed' }
+            try { $jobsDocument = (($jobsRaw -join [Environment]::NewLine) | ConvertFrom-Json) }
+            catch { throw 'workflow timing response was invalid' }
+            $jobs = @($jobsDocument.jobs)
+            $firstJob = @($jobs |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_.started_at) } |
+              Sort-Object { [DateTimeOffset]::Parse($_.started_at) } |
+              Select-Object -First 1)
+            $releaseJob = @($jobs |
+              Where-Object { $_.name -like "release-$env:PROJECT_ID*" } |
+              Select-Object -First 1)
+            $publicationStep = @($releaseJob.steps |
+              Where-Object { $_.name -eq 'Publish private release' -and -not [string]::IsNullOrWhiteSpace($_.completed_at) } |
+              Select-Object -Last 1)
+            if (($firstJob.Count -eq 0 -or $releaseJob.Count -eq 0 -or $publicationStep.Count -eq 0) -and
+                [DateTimeOffset]::UtcNow -lt $timingDeadline) {
+              Start-Sleep -Seconds 5
+            }
+          } while (($firstJob.Count -eq 0 -or $releaseJob.Count -eq 0 -or $publicationStep.Count -eq 0) -and
+                   [DateTimeOffset]::UtcNow -lt $timingDeadline)
           if ($firstJob.Count -eq 0 -or $releaseJob.Count -eq 0 -or $publicationStep.Count -eq 0) {
             throw 'workflow timing evidence is incomplete'
           }
