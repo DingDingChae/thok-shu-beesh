@@ -1,3 +1,10 @@
 {
-  "projects": []
+  "projects": [
+    {
+      "id": "p06ecfac88a9",
+      "runner": "windows-latest",
+      "secret_suffix": "P06ECFAC88A9",
+      "rev": "cf964e6d8e07d90a"
+    }
+  ]
 }
